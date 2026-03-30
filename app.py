@@ -44,8 +44,8 @@ def init_state() -> None:
             {
                 "role": "assistant",
                 "content": (
-                    "Здравствуйте. Прикрепите CSV/Excel через скрепку и напишите запрос. "
-                    "Я покажу краткую аналитику в формате чата."
+                    "Здравствуйте. Прикрепите CSV/Excel через скрепку и (или) напишите запрос. "
+                    "Я покажу краткую аналитику в чате."
                 ),
             }
         ]
@@ -120,7 +120,7 @@ def build_reply(user_prompt: str) -> str:
     if df is None:
         return "\n".join(
             [
-                "Файл не подключен, поэтому сделал разбор только вашего текста.",
+                "Сделал разбор вашего текста.",
                 "",
                 text_brief(prompt),
                 "",
@@ -231,9 +231,7 @@ def render_chat() -> None:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if st.session_state.df is None:
-        st.caption("Файл не подключен.")
-    else:
+    if st.session_state.df is not None:
         c1, c2 = st.columns([6, 1])
         with c1:
             r, c = st.session_state.df.shape
@@ -274,9 +272,61 @@ def main() -> None:
         """
         <style>
             .block-container {
-                max-width: 980px;
+                max-width: 1200px;
                 padding-top: 1.5rem;
                 padding-bottom: 1.5rem;
+            }
+            div[data-testid="stChatInput"] [data-baseweb="textarea"] {
+                border-radius: 16px !important;
+                overflow: hidden !important;
+            }
+            div[data-testid="stChatInput"] [data-baseweb="textarea"] textarea {
+                min-height: 72px !important;
+                line-height: 1.35 !important;
+                padding-top: 24px !important;
+                padding-bottom: 24px !important;
+                padding-left: 16px !important;
+                padding-right: 12px !important;
+                box-sizing: border-box !important;
+            }
+            div[data-testid="stChatInput"] [data-baseweb="textarea"] textarea::placeholder {
+                opacity: 0.9 !important;
+            }
+            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] {
+                border-right: none !important;
+                box-shadow: none !important;
+                align-self: center !important;
+                margin-top: 0 !important;
+            }
+            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] > button {
+                width: 40px !important;
+                height: 40px !important;
+                min-height: 40px !important;
+                border-radius: 999px !important;
+                border: 1px solid #d7dbe0 !important;
+                background: #ffffff !important;
+                padding: 0 !important;
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+            }
+            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] > button:hover,
+            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] > button:focus,
+            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] > button:focus-visible {
+                border-color: #d7dbe0 !important;
+                box-shadow: none !important;
+                background: #ffffff !important;
+                outline: none !important;
+            }
+            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] + div {
+                display: block !important;
+                width: 1px !important;
+                min-width: 1px !important;
+                height: 32px !important;
+                margin-top: 0 !important;
+                margin-left: 10px !important;
+                align-self: center !important;
+                background: #e5e7eb !important;
             }
         </style>
         """,
