@@ -1,0 +1,6 @@
+services:
+  llm-analytics:
+    build: .
+    container_name: llm-analytics
+    ports:
+      - "8501:8501"
