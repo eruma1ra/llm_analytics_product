@@ -652,26 +652,19 @@ def apply_ui_styles() -> None:
         """
         <style>
             :root {
-                --chat-item-hover-bg: #eef0f2;
-                --chat-item-hover-border: #eef0f2;
-                --chat-item-active-bg: #e9ecef;
-                --chat-item-active-border: #d9dee5;
-            }
-            [data-theme="dark"],
-            html[data-theme="dark"],
-            body[data-theme="dark"] {
-                --chat-item-hover-bg: #2b2f36;
-                --chat-item-hover-border: #2b2f36;
-                --chat-item-active-bg: #363b44;
-                --chat-item-active-border: #454d59;
+                --chat-item-active-bg: #eceff3;
             }
             @media (prefers-color-scheme: dark) {
                 :root {
-                    --chat-item-hover-bg: #2b2f36;
-                    --chat-item-hover-border: #2b2f36;
-                    --chat-item-active-bg: #363b44;
-                    --chat-item-active-border: #454d59;
+                    --chat-item-active-bg: #323842;
                 }
+            }
+            [data-theme="dark"],
+            html[data-theme="dark"],
+            body[data-theme="dark"],
+            .stApp[data-theme="dark"],
+            [data-testid="stAppViewContainer"][data-theme="dark"] {
+                --chat-item-active-bg: #323842;
             }
             .block-container {
                 max-width: 1200px;
@@ -756,45 +749,61 @@ def apply_ui_styles() -> None:
                 max-width: 100% !important;
                 box-sizing: border-box !important;
                 overflow: hidden !important;
-                border: 1px solid transparent;
+                border: none !important;
                 border-radius: 14px !important;
                 padding: 0.42rem 0.7rem;
-                transition: background-color 120ms ease, border-color 120ms ease;
+                transition: background-color 120ms ease;
                 box-shadow: none !important;
                 outline: none !important;
+                -webkit-tap-highlight-color: transparent !important;
             }
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:hover {
-                background: var(--chat-item-hover-bg) !important;
-                border: 1px solid var(--chat-item-hover-border) !important;
+                background: var(--chat-item-active-bg) !important;
+                border: none !important;
             }
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:has(input:checked),
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"][aria-checked="true"],
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"][aria-checked="true"] {
                 background: var(--chat-item-active-bg) !important;
-                border: 1px solid var(--chat-item-active-border) !important;
-                color: inherit !important;
+                border: none !important;
+                color: #1f2937 !important;
             }
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:focus-within,
-            section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"]:focus-within {
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"]:focus-within,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:focus,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"]:focus,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:focus-visible,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"]:focus-visible {
                 box-shadow: none !important;
                 outline: none !important;
+                border: none !important;
             }
             /* Fallback для браузеров/разметки, где active не ловится через :has */
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"] input[type="radio"]:checked + div + div {
                 background: var(--chat-item-active-bg) !important;
-                border: 1px solid var(--chat-item-active-border) !important;
+                border: none !important;
                 border-radius: 12px !important;
                 margin: -0.26rem -0.48rem !important;
                 padding: 0.26rem 0.48rem !important;
                 box-sizing: border-box !important;
+                color: #1f2937 !important;
+            }
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:hover,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:hover p {
+                color: #1f2937 !important;
             }
             section[data-testid="stSidebar"] div[data-testid="stRadio"] input[type="radio"] {
                 accent-color: #6b7280 !important;
             }
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] input[type="radio"]:focus,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] input[type="radio"]:focus-visible {
+                outline: none !important;
+                box-shadow: none !important;
+            }
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:has(input:checked) p,
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"][aria-checked="true"] p,
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"][aria-checked="true"] p {
-                color: inherit !important;
+                color: #1f2937 !important;
             }
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"] > div:first-child {
                 display: none !important;
