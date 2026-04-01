@@ -651,6 +651,28 @@ def apply_ui_styles() -> None:
     st.markdown(
         """
         <style>
+            :root {
+                --chat-item-hover-bg: #eef0f2;
+                --chat-item-hover-border: #eef0f2;
+                --chat-item-active-bg: #e9ecef;
+                --chat-item-active-border: #d9dee5;
+            }
+            [data-theme="dark"],
+            html[data-theme="dark"],
+            body[data-theme="dark"] {
+                --chat-item-hover-bg: #2b2f36;
+                --chat-item-hover-border: #2b2f36;
+                --chat-item-active-bg: #363b44;
+                --chat-item-active-border: #454d59;
+            }
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --chat-item-hover-bg: #2b2f36;
+                    --chat-item-hover-border: #2b2f36;
+                    --chat-item-active-bg: #363b44;
+                    --chat-item-active-border: #454d59;
+                }
+            }
             .block-container {
                 max-width: 1200px;
                 padding-top: 3.2rem;
@@ -738,14 +760,41 @@ def apply_ui_styles() -> None:
                 border-radius: 14px !important;
                 padding: 0.42rem 0.7rem;
                 transition: background-color 120ms ease, border-color 120ms ease;
+                box-shadow: none !important;
+                outline: none !important;
             }
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:hover {
-                background: #eef0f2 !important;
-                border: 1px solid #eef0f2 !important;
+                background: var(--chat-item-hover-bg) !important;
+                border: 1px solid var(--chat-item-hover-border) !important;
             }
-            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:has(input:checked) {
-                background: #e9ecef !important;
-                border: 1px solid #e0e5ea !important;
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:has(input:checked),
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"][aria-checked="true"],
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"][aria-checked="true"] {
+                background: var(--chat-item-active-bg) !important;
+                border: 1px solid var(--chat-item-active-border) !important;
+                color: inherit !important;
+            }
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:focus-within,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"]:focus-within {
+                box-shadow: none !important;
+                outline: none !important;
+            }
+            /* Fallback для браузеров/разметки, где active не ловится через :has */
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"] input[type="radio"]:checked + div + div {
+                background: var(--chat-item-active-bg) !important;
+                border: 1px solid var(--chat-item-active-border) !important;
+                border-radius: 12px !important;
+                margin: -0.26rem -0.48rem !important;
+                padding: 0.26rem 0.48rem !important;
+                box-sizing: border-box !important;
+            }
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] input[type="radio"] {
+                accent-color: #6b7280 !important;
+            }
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"]:has(input:checked) p,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"][aria-checked="true"] p,
+            section[data-testid="stSidebar"] div[data-testid="stRadio"] [role="radio"][aria-checked="true"] p {
+                color: inherit !important;
             }
             section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-baseweb="radio"] > div:first-child {
                 display: none !important;
