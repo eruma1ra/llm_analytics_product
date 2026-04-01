@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import pandas as pd
@@ -10,6 +12,13 @@ from dotenv import load_dotenv
 
 
 load_dotenv()
+JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(?P<body>.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+@dataclass
+class ChatCompletionResult:
+    content: str
+    finish_reason: str
 
 
 def _env(name: str) -> str:
@@ -34,7 +43,6 @@ def _env_float(name: str) -> float:
 
 
 def load_llm_config() -> dict[str, Any]:
-    # Конфиг читаем строго из .env, без дефолтов в коде.
     return {
         "provider_label": _env("LLM_PROVIDER_LABEL"),
         "api_base_url": _env("LLM_API_BASE_URL"),
@@ -49,7 +57,6 @@ def load_llm_config() -> dict[str, Any]:
 
 
 def _resolve_api_key(api_key: str = "") -> str:
-    # Ключ берем из аргумента или из .env, чтобы UI оставался чистым.
     candidate = (api_key or "").strip()
     if candidate:
         return candidate
@@ -91,7 +98,13 @@ def build_dataframe_context(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
     }
 
 
-def build_llm_messages(
+def _wants_charts(prompt: str) -> bool:
+    text = (prompt or "").lower()
+    markers = ("график", "диаграм", "чарт", "chart", "plot", "plotly", "тренд", "trend")
+    return any(marker in text for marker in markers)
+
+
+def build_text_messages(
     user_prompt: str,
     df: Optional[pd.DataFrame],
     config: dict[str, Any],
@@ -101,8 +114,15 @@ def build_llm_messages(
             {
                 "role": "system",
                 "content": (
-                    "Вы аналитический ассистент. Отвечайте обычным текстом на русском языке. "
-                    "Без JSON и без кода."
+                    "Вы аналитический ассистент. "
+                    "На любые вопросы отвечайте строго с аналитической точки зрения. "
+                    "Даже если вопрос общий (например, про город), давайте ответ через метрики, "
+                    "сравнения, факторы и проверяемые выводы. "
+                    "Отвечайте по факту: только на то, что спросили, без лишних отступлений. "
+                    "Формулировки должны быть конкретными, не расплывчатыми. "
+                    "Ответ должен быть коротким: 3-6 предложений или 3-6 коротких пунктов. "
+                    "Без воды, без повторов, без вводных фраз. "
+                    "Верните только текст на русском языке, без JSON и без кода."
                 ),
             },
             {"role": "user", "content": user_prompt},
@@ -114,8 +134,43 @@ def build_llm_messages(
             "role": "system",
             "content": (
                 "Вы аналитический ассистент по таблицам. "
-                "Отвечайте только обычным текстом на русском, без JSON и без markdown-блоков кода. "
-                "Давайте короткий, понятный вывод по запросу пользователя."
+                "Отвечайте строго как аналитик: фактами, проверяемыми выводами и конкретикой. "
+                "Всегда держите ответ в рамках вопроса пользователя: не добавляйте лишние темы. "
+                "Если вопрос широкий, структурируйте ответ через метрики, причины и следствия. "
+                "Избегайте расплывчатых формулировок. "
+                "Ответ должен быть коротким: 4-8 коротких пунктов по сути. "
+                "Пишите только факты и выводы, без длинных вступлений и общих рассуждений. "
+                "Верните только текст на русском языке, без JSON и без кода."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Запрос пользователя: {user_prompt}\n\n"
+                f"Контекст таблицы JSON:\n{json.dumps(context, ensure_ascii=False)}"
+            ),
+        },
+    ]
+
+
+def build_chart_messages(
+    user_prompt: str,
+    df: pd.DataFrame,
+    config: dict[str, Any],
+) -> list[dict[str, str]]:
+    context = build_dataframe_context(df, max_rows=config["max_context_rows"])
+    max_charts = max(1, min(int(config["max_charts"]), 5))
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Вы генератор спецификаций графиков для UI. "
+                "Верните ТОЛЬКО JSON без markdown. "
+                "Формат: {\"charts\":[{\"type\":\"bar|line|scatter|pie|histogram\","
+                "\"x\":\"<col>\",\"y\":\"<col|null>\",\"agg\":\"sum|mean|count|median|max|min\","
+                "\"title\":\"<text>\",\"top_n\":30}]}. "
+                f"Максимум графиков: {max_charts}. "
+                "Используйте только реальные названия колонок из данных."
             ),
         },
         {
@@ -158,18 +213,58 @@ def _extract_content(data: dict[str, Any]) -> str:
     raise ValueError("Не удалось извлечь текст ответа модели.")
 
 
+def _extract_finish_reason(data: dict[str, Any]) -> str:
+    choices = data.get("choices", [])
+    if not choices:
+        return ""
+    return str(choices[0].get("finish_reason", "") or "")
+
+
+def _looks_truncated(text: str) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+
+    if cleaned.endswith(("**", "*", "```", "`", "(", "[", "{", ":", "-", "—", "–", ",")):
+        return True
+    if cleaned.count("**") % 2 == 1:
+        return True
+    if cleaned.count("```") % 2 == 1:
+        return True
+    return False
+
+
+def _merge_with_overlap(base: str, continuation: str) -> str:
+    left = (base or "").rstrip()
+    right = (continuation or "").strip()
+    if not right:
+        return left
+    if right in left:
+        return left
+
+    max_overlap = min(len(left), len(right), 300)
+    overlap = 0
+    for size in range(max_overlap, 2, -1):
+        if left[-size:] == right[:size]:
+            overlap = size
+            break
+
+    if overlap > 0:
+        return (left + right[overlap:]).strip()
+    return (left + "\n" + right).strip()
+
+
 def call_chat_completion(
     messages: list[dict[str, str]],
     api_key: str,
     config: dict[str, Any],
-) -> str:
+) -> ChatCompletionResult:
     payload = {
         "model": config["model"],
         "messages": messages,
         "temperature": config["temperature"],
         "max_tokens": config["max_tokens"],
     }
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -181,7 +276,68 @@ def call_chat_completion(
         timeout=config["timeout_seconds"],
     )
     response.raise_for_status()
-    return _extract_content(response.json())
+    data = response.json()
+    return ChatCompletionResult(
+        content=_extract_content(data),
+        finish_reason=_extract_finish_reason(data),
+    )
+
+
+def _extract_json_candidates(text: str) -> list[str]:
+    candidates = [text.strip()]
+    for match in JSON_BLOCK_RE.finditer(text or ""):
+        body = (match.group("body") or "").strip()
+        if body:
+            candidates.append(body)
+
+    raw = text or ""
+    left_brace = raw.find("{")
+    right_brace = raw.rfind("}")
+    if left_brace >= 0 and right_brace > left_brace:
+        candidates.append(raw[left_brace : right_brace + 1])
+    left_bracket = raw.find("[")
+    right_bracket = raw.rfind("]")
+    if left_bracket >= 0 and right_bracket > left_bracket:
+        candidates.append(raw[left_bracket : right_bracket + 1])
+
+    # Убираем дубли, сохраняя порядок.
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return unique
+
+
+def _parse_chart_specs(raw: str, max_charts: int) -> list[dict[str, Any]]:
+    limit = max(0, min(int(max_charts), 5))
+    for candidate in _extract_json_candidates(raw):
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+
+        charts: list[Any] = []
+        if isinstance(data, list):
+            charts = data
+        elif isinstance(data, dict):
+            payload = data.get("charts")
+            if isinstance(payload, list):
+                charts = payload
+
+        if not charts:
+            continue
+
+        cleaned: list[dict[str, Any]] = []
+        for item in charts:
+            if isinstance(item, dict):
+                cleaned.append(item)
+            if len(cleaned) >= limit:
+                break
+        if cleaned:
+            return cleaned
+    return []
 
 
 def get_ai_response(
@@ -192,7 +348,50 @@ def get_ai_response(
 ) -> dict[str, Any]:
     resolved_api_key = _resolve_api_key(api_key)
 
-    messages = build_llm_messages(user_prompt=user_prompt, df=df, config=config)
-    raw_output = call_chat_completion(messages=messages, api_key=resolved_api_key, config=config)
-    summary = raw_output.strip() or "Модель не вернула текстовый ответ."
-    return {"summary": summary, "key_metrics": [], "charts": []}
+    text_messages = build_text_messages(user_prompt=user_prompt, df=df, config=config)
+    text_result = call_chat_completion(
+        messages=text_messages,
+        api_key=resolved_api_key,
+        config=config,
+    )
+    summary = text_result.content.strip() or "Модель не вернула текстовый ответ."
+
+    # Если модель оборвала текст, делаем 1-2 дозапроса на продолжение.
+    attempts = 0
+    while attempts < 2 and (
+        text_result.finish_reason.lower() == "length" or _looks_truncated(summary)
+    ):
+        continuation_messages = text_messages + [
+            {"role": "assistant", "content": summary},
+            {
+                "role": "user",
+                "content": (
+                    "Продолжите ответ с того же места. "
+                    "Нужен только хвост продолжения, без повторов уже написанного."
+                ),
+            },
+        ]
+        text_result = call_chat_completion(
+            messages=continuation_messages,
+            api_key=resolved_api_key,
+            config=config,
+        )
+        summary = _merge_with_overlap(summary, text_result.content)
+        attempts += 1
+
+    chart_specs: list[dict[str, Any]] = []
+    if df is not None and _wants_charts(user_prompt):
+        try:
+            chart_raw = call_chat_completion(
+                messages=build_chart_messages(user_prompt=user_prompt, df=df, config=config),
+                api_key=resolved_api_key,
+                config=config,
+            ).content
+            chart_specs = _parse_chart_specs(chart_raw, max_charts=config["max_charts"])
+        except Exception:
+            chart_specs = []
+
+    return {
+        "summary": summary,
+        "chart_specs": chart_specs,
+    }

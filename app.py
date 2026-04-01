@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 import re
 import time
 from typing import Any, Optional
@@ -10,7 +10,12 @@ from uuid import uuid4
 import pandas as pd
 import streamlit as st
 
-from analytics_core import build_chart_figure, build_local_fallback_payload
+from analytics_core import (
+    build_chart_figure,
+    build_fallback_chart_specs,
+    normalize_chart_specs,
+    wants_chart_request,
+)
 from chat_cache import cleanup_expired_cache, persist_user_cache, restore_user_cache
 from llm_client import get_ai_response, load_llm_config
 
@@ -57,6 +62,56 @@ def _convert_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
     return converted
 
 
+def _finalize_text_table_candidate(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if df is None or df.empty:
+        return None
+
+    prepared = df.copy()
+    prepared = prepared.dropna(axis=1, how="all")
+    prepared.columns = [str(col).strip() for col in prepared.columns]
+    if prepared.shape[1] < 2 or prepared.shape[0] < 2:
+        return None
+
+    prepared = _convert_numeric_like_columns(prepared)
+    numeric_cols = prepared.select_dtypes(include="number").shape[1]
+    if numeric_cols < 1:
+        return None
+    return prepared
+
+
+def _try_parse_delimited_text(cleaned: str) -> Optional[pd.DataFrame]:
+    for sep in ("\t", ";", "|", ","):
+        try:
+            candidate = pd.read_csv(StringIO(cleaned), sep=sep)
+        except Exception:
+            continue
+        ready = _finalize_text_table_candidate(candidate)
+        if ready is not None:
+            return ready
+    return None
+
+
+def _try_parse_spaced_columns(cleaned: str) -> Optional[pd.DataFrame]:
+    lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return None
+
+    split_lines = [re.split(r"\t| {2,}", line.strip()) for line in lines]
+    width = len(split_lines[0])
+    if width < 2:
+        return None
+    if not all(len(parts) == width for parts in split_lines[1:]):
+        return None
+
+    header = split_lines[0]
+    rows = split_lines[1:]
+    if len(set(header)) != len(header):
+        return None
+
+    candidate = pd.DataFrame(rows, columns=header)
+    return _finalize_text_table_candidate(candidate)
+
+
 def try_parse_table_from_text(text: str) -> Optional[pd.DataFrame]:
     cleaned = text.strip()
     if not cleaned:
@@ -70,6 +125,14 @@ def try_parse_table_from_text(text: str) -> Optional[pd.DataFrame]:
     )
     if anchor:
         cleaned = cleaned[anchor.start() :]
+
+    # 0) Универсальный парсинг для таблиц из Excel/текста.
+    delimited = _try_parse_delimited_text(cleaned)
+    if delimited is not None:
+        return delimited
+    spaced = _try_parse_spaced_columns(cleaned)
+    if spaced is not None:
+        return spaced
 
     # 1) Кейс, когда таблицу вставили несколькими строками.
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
@@ -445,14 +508,11 @@ def render_chat_message(message: dict[str, Any], index: int) -> None:
         if message["role"] != "assistant":
             return
 
-        key_metrics = message.get("key_metrics", [])
-        if key_metrics:
-            st.markdown("**Ключевые метрики:**")
-            for metric in key_metrics:
-                st.markdown(f"- {metric}")
+        chart_specs = message.get("chart_specs", [])
+        if not chart_specs:
+            return
 
-        chart_specs = message.get("charts", [])
-        if chart_specs and st.session_state.df is None:
+        if st.session_state.df is None:
             st.caption("Для построения графиков нужно снова подключить файл.")
             return
 
@@ -468,8 +528,8 @@ def render_chat_message(message: dict[str, Any], index: int) -> None:
                     use_container_width=True,
                     key=f"chart_{index}_{chart_idx}",
                 )
-            except Exception:
-                st.caption(f"Не удалось построить график: {chart_title}")
+            except Exception as exc:
+                st.caption(f"Не удалось построить график: {chart_title}. Ошибка: {exc}")
 
 
 def render_chat(llm_config: dict[str, Any]) -> None:
@@ -514,26 +574,37 @@ def render_chat(llm_config: dict[str, Any]) -> None:
         st.markdown(user_prompt)
 
     try:
-        # Берем текстовый ответ от модели, а метрики/графики строим локально в UI.
+        # Берем текст и спецификации графиков от модели.
         ai_payload = get_ai_response(
             user_prompt=user_prompt,
             df=st.session_state.df,
             config=llm_config,
         )
-        helper_payload = build_local_fallback_payload(user_prompt, st.session_state.df)
+
+        chart_specs: list[dict[str, Any]] = []
+        if st.session_state.df is not None:
+            chart_specs = normalize_chart_specs(
+                ai_payload.get("chart_specs", []),
+                st.session_state.df,
+                max_charts=llm_config["max_charts"],
+            )
+            if wants_chart_request(user_prompt) and not chart_specs:
+                chart_specs = build_fallback_chart_specs(
+                    user_prompt,
+                    st.session_state.df,
+                    max_charts=llm_config["max_charts"],
+                )
+
         assistant_message: dict[str, Any] = {
             "role": "assistant",
             "content": ai_payload["summary"],
-            "key_metrics": helper_payload["key_metrics"],
-            "charts": helper_payload["charts"],
+            "chart_specs": chart_specs,
         }
     except Exception as exc:
-        helper_payload = build_local_fallback_payload(user_prompt, st.session_state.df)
         assistant_message = {
             "role": "assistant",
-            "content": helper_payload["summary"],
-            "key_metrics": helper_payload["key_metrics"],
-            "charts": helper_payload["charts"],
+            "content": "Не удалось получить ответ от модели. Проверьте настройки API и повторите запрос.",
+            "chart_specs": [],
         }
         st.warning(f"Ответ от модели временно недоступен: {exc}")
 
