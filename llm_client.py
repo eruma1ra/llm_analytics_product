@@ -4,11 +4,13 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+
+from llm_stream import stream_chat_completion
 
 
 load_dotenv()
@@ -139,6 +141,8 @@ def build_text_messages(
                 "Если вопрос широкий, структурируйте ответ через метрики, причины и следствия. "
                 "Избегайте расплывчатых формулировок. "
                 "Ответ должен быть коротким: 4-8 коротких пунктов по сути. "
+                "Если в данных есть безымянные колонки вида 'Unnamed: N', "
+                "давайте им осмысленные названия по контексту и используйте их в ответе. "
                 "Пишите только факты и выводы, без длинных вступлений и общих рассуждений. "
                 "Верните только текст на русском языке, без JSON и без кода."
             ),
@@ -168,9 +172,26 @@ def build_chart_messages(
                 "Верните ТОЛЬКО JSON без markdown. "
                 "Формат: {\"charts\":[{\"type\":\"bar|line|scatter|pie|histogram\","
                 "\"x\":\"<col>\",\"y\":\"<col|null>\",\"agg\":\"sum|mean|count|median|max|min\","
-                "\"title\":\"<text>\",\"top_n\":30}]}. "
+                "\"title\":\"<text>\",\"x_label\":\"<alias|null>\",\"y_label\":\"<alias|null>\",\"top_n\":30}]}. "
                 f"Максимум графиков: {max_charts}. "
-                "Используйте только реальные названия колонок из данных."
+                "Используйте только реальные названия колонок из данных. "
+                "Если type='pie' и есть числовой столбец (например, Остаток/Количество/Revenue), "
+                "обязательно ставьте его в y и agg='sum', не используйте count. "
+                "Если пользователь просит график по метрике (например, выручка/revenue, остаток/stock, продажи/sales), "
+                "обязательно укажите эту метрику в y и agg='sum' или 'mean' по смыслу. "
+                "Не возвращайте график с agg='count', если пользователь явно не просил количество записей. "
+                "Если пользователь просит конкретное количество графиков (например, 1 график), "
+                "верните ровно это количество, без дополнительных графиков. "
+                "Не добавляйте лишние графики «для полноты». "
+                "Если пользователь просит конкретный тип (например, круговая/линейная/столбчатая), "
+                "возвращайте только этот тип графика. "
+                "Если колонка называется 'Unnamed: N', придумайте осмысленный псевдоним по данным "
+                "и передайте его в x_label/y_label. "
+                "Язык псевдонима выбирайте по языку данных: "
+                "если названия в данных на английском, псевдоним на английском; "
+                "если на русском, псевдоним на русском. "
+                "Не смешивайте языки в одном псевдониме. "
+                "В x и y всегда оставляйте оригинальные названия колонок."
             ),
         },
         {
@@ -283,6 +304,84 @@ def call_chat_completion(
     )
 
 
+def stream_text_response(
+    user_prompt: str,
+    df: Optional[pd.DataFrame],
+    config: dict[str, Any],
+    api_key: str = "",
+) -> Iterator[str]:
+    resolved_api_key = _resolve_api_key(api_key)
+    text_messages = build_text_messages(user_prompt=user_prompt, df=df, config=config)
+    plain_user_content = text_messages[-1]["content"] if text_messages else user_prompt
+
+    def _call_nonempty_text(messages: list[dict[str, str]], max_attempts: int = 3) -> str:
+        attempt_messages = list(messages)
+        for attempt in range(max_attempts):
+            result = call_chat_completion(
+                messages=attempt_messages,
+                api_key=resolved_api_key,
+                config=config,
+            )
+            cleaned = (result.content or "").strip()
+            if cleaned:
+                return cleaned
+
+            # 1) Просим явно вернуть непустой текст.
+            if attempt == 0:
+                attempt_messages = messages + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Ответ должен быть непустым. "
+                            "Верните краткий содержательный ответ на русском языке."
+                        ),
+                    }
+                ]
+                continue
+
+            # 2) Максимально простой системный запрос без сложных ограничений.
+            if attempt == 1:
+                attempt_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Вы помощник. Верните непустой, краткий и конкретный ответ "
+                            "на русском языке по вопросу пользователя."
+                        ),
+                    },
+                    {"role": "user", "content": plain_user_content},
+                ]
+
+        return ""
+
+    try:
+        streamed_has_text = False
+        for chunk in stream_chat_completion(
+            url=_chat_url(config),
+            api_key=resolved_api_key,
+            model=config["model"],
+            messages=text_messages,
+            temperature=config["temperature"],
+            max_tokens=config["max_tokens"],
+            timeout_seconds=config["timeout_seconds"],
+        ):
+            if str(chunk).strip():
+                streamed_has_text = True
+            yield chunk
+        if streamed_has_text:
+            return
+    except Exception:
+        # Если stream не поддерживается провайдером, мягко откатываемся на обычный запрос.
+        pass
+
+    fallback_text = _call_nonempty_text(text_messages, max_attempts=3)
+    if fallback_text:
+        yield fallback_text
+        return
+
+    yield "Сервис временно не дал содержательный ответ. Я сделал несколько попыток автоматически."
+
+
 def _extract_json_candidates(text: str) -> list[str]:
     candidates = [text.strip()]
     for match in JSON_BLOCK_RE.finditer(text or ""):
@@ -338,6 +437,27 @@ def _parse_chart_specs(raw: str, max_charts: int) -> list[dict[str, Any]]:
         if cleaned:
             return cleaned
     return []
+
+
+def get_chart_specs(
+    user_prompt: str,
+    df: Optional[pd.DataFrame],
+    config: dict[str, Any],
+    api_key: str = "",
+) -> list[dict[str, Any]]:
+    if df is None or not _wants_charts(user_prompt):
+        return []
+
+    resolved_api_key = _resolve_api_key(api_key)
+    try:
+        chart_raw = call_chat_completion(
+            messages=build_chart_messages(user_prompt=user_prompt, df=df, config=config),
+            api_key=resolved_api_key,
+            config=config,
+        ).content
+        return _parse_chart_specs(chart_raw, max_charts=config["max_charts"])
+    except Exception:
+        return []
 
 
 def get_ai_response(

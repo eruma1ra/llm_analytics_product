@@ -13,11 +13,13 @@ import streamlit as st
 from analytics_core import (
     build_chart_figure,
     build_fallback_chart_specs,
+    infer_requested_chart_limit,
     normalize_chart_specs,
+    select_chart_specs_by_prompt,
     wants_chart_request,
 )
 from chat_cache import cleanup_expired_cache, persist_user_cache, restore_user_cache
-from llm_client import get_ai_response, load_llm_config
+from llm_client import get_chart_specs, load_llm_config, stream_text_response
 
 
 st.set_page_config(page_title="LLM-аналитика", layout="wide")
@@ -573,43 +575,76 @@ def render_chat(llm_config: dict[str, Any]) -> None:
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
-    try:
-        # Берем текст и спецификации графиков от модели.
-        ai_payload = get_ai_response(
-            user_prompt=user_prompt,
-            df=st.session_state.df,
-            config=llm_config,
-        )
+    assistant_text = ""
+    chart_specs: list[dict[str, Any]] = []
+    requested_chart_limit = infer_requested_chart_limit(
+        user_prompt,
+        default_limit=llm_config["max_charts"],
+    )
 
-        chart_specs: list[dict[str, Any]] = []
-        if st.session_state.df is not None:
-            chart_specs = normalize_chart_specs(
-                ai_payload.get("chart_specs", []),
-                st.session_state.df,
-                max_charts=llm_config["max_charts"],
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        try:
+            for chunk in stream_text_response(
+                user_prompt=user_prompt,
+                df=st.session_state.df,
+                config=llm_config,
+            ):
+                assistant_text += chunk
+                placeholder.markdown(assistant_text + "▌")
+
+            assistant_text = assistant_text.strip() or "Модель не вернула текстовый ответ."
+            placeholder.markdown(assistant_text)
+
+            raw_chart_specs = get_chart_specs(
+                user_prompt=user_prompt,
+                df=st.session_state.df,
+                config=llm_config,
             )
-            if wants_chart_request(user_prompt) and not chart_specs:
-                chart_specs = build_fallback_chart_specs(
-                    user_prompt,
+            if st.session_state.df is not None:
+                normalized_specs = normalize_chart_specs(
+                    raw_chart_specs,
                     st.session_state.df,
-                    max_charts=llm_config["max_charts"],
+                    max_charts=requested_chart_limit,
                 )
+                chart_specs = select_chart_specs_by_prompt(
+                    normalized_specs,
+                    user_prompt,
+                    default_limit=requested_chart_limit,
+                )
+                if wants_chart_request(user_prompt) and not chart_specs:
+                    fallback_specs = build_fallback_chart_specs(
+                        user_prompt,
+                        st.session_state.df,
+                        max_charts=requested_chart_limit,
+                    )
+                    chart_specs = select_chart_specs_by_prompt(
+                        fallback_specs,
+                        user_prompt,
+                        default_limit=requested_chart_limit,
+                    )
 
-        assistant_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": ai_payload["summary"],
-            "chart_specs": chart_specs,
-        }
-    except Exception as exc:
-        assistant_message = {
-            "role": "assistant",
-            "content": "Не удалось получить ответ от модели. Проверьте настройки API и повторите запрос.",
-            "chart_specs": [],
-        }
-        st.warning(f"Ответ от модели временно недоступен: {exc}")
+            for chart_idx, chart_spec in enumerate(chart_specs):
+                figure = build_chart_figure(st.session_state.df, chart_spec)
+                if figure is None:
+                    continue
+                st.plotly_chart(
+                    figure,
+                    use_container_width=True,
+                    key=f"new_chart_{len(st.session_state.messages)}_{chart_idx}",
+                )
+        except Exception as exc:
+            assistant_text = "Не удалось получить ответ от модели. Проверьте настройки API и повторите запрос."
+            placeholder.markdown(assistant_text)
+            st.warning(f"Ответ от модели временно недоступен: {exc}")
+            chart_specs = []
 
+    assistant_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": assistant_text,
+        "chart_specs": chart_specs,
+    }
     _append_and_store_message(assistant_message)
-    render_chat_message(assistant_message, len(st.session_state.messages) - 1)
 
 
 def apply_ui_styles() -> None:
