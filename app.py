@@ -634,7 +634,7 @@ def apply_ui_styles() -> None:
                 padding-top: 24px !important;
                 padding-bottom: 24px !important;
                 padding-left: 16px !important;
-                padding-right: 12px !important;
+                padding-right: 60px !important;
                 box-sizing: border-box !important;
             }
             div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] {
