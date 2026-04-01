@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import re
-from collections import Counter
 from io import BytesIO
-from typing import Optional
+import re
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
+
+from analytics_core import build_chart_figure, build_local_fallback_payload
+from llm_client import get_ai_response, load_llm_config
 
 
 st.set_page_config(page_title="LLM-аналитика", layout="wide")
@@ -38,6 +40,80 @@ def validate_file_size(file_size: int) -> Optional[str]:
     return None
 
 
+def _convert_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
+    converted = df.copy()
+    for col in converted.columns:
+        numeric = pd.to_numeric(converted[col], errors="coerce")
+        if float(numeric.notna().mean()) >= 0.8:
+            converted[col] = numeric
+    return converted
+
+
+def try_parse_table_from_text(text: str) -> Optional[pd.DataFrame]:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    # Часто запрос идет перед таблицей в одной строке.
+    anchor = re.search(
+        r"\bLocation\s+Country\s+Category\s+Visitors\s+Rating\s+Revenue\s+Accommodation_Available\b",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if anchor:
+        cleaned = cleaned[anchor.start() :]
+
+    # 1) Кейс, когда таблицу вставили несколькими строками.
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    split_lines = [re.split(r"\s+", line) for line in lines]
+    if len(split_lines) >= 3:
+        width = len(split_lines[0])
+        if width >= 4 and all(len(parts) == width for parts in split_lines[1:]):
+            header = split_lines[0]
+            rows = split_lines[1:]
+            if len(set(header)) == len(header):
+                df = pd.DataFrame(rows, columns=header)
+                df = _convert_numeric_like_columns(df)
+                if df.select_dtypes(include="number").shape[1] >= 2:
+                    return df
+
+    # 2) Кейс, когда таблица пришла одной строкой (как в чате).
+    tokens = re.split(r"\s+", cleaned)
+    if len(tokens) < 28:
+        return None
+
+    best_df: Optional[pd.DataFrame] = None
+    best_score = -1
+    max_width = min(14, len(tokens) // 3)
+    for width in range(4, max_width + 1):
+        header = tokens[:width]
+        body = tokens[width:]
+        if len(body) % width != 0:
+            continue
+
+        row_count = len(body) // width
+        if row_count < 3:
+            continue
+        if len(set(header)) != len(header):
+            continue
+        if not all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col) for col in header):
+            continue
+
+        rows = [body[i : i + width] for i in range(0, len(body), width)]
+        df = pd.DataFrame(rows, columns=header)
+        df = _convert_numeric_like_columns(df)
+        numeric_cols = df.select_dtypes(include="number").shape[1]
+        if numeric_cols < 2:
+            continue
+
+        score = row_count * 10 + numeric_cols
+        if score > best_score:
+            best_score = score
+            best_df = df
+
+    return best_df
+
+
 def init_state() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = [
@@ -53,109 +129,6 @@ def init_state() -> None:
         st.session_state.df = None
     if "file_name" not in st.session_state:
         st.session_state.file_name = None
-    if "uploaded_signature" not in st.session_state:
-        st.session_state.uploaded_signature = None
-
-
-def file_brief(df: pd.DataFrame) -> str:
-    rows, cols = df.shape
-    missing = int(df.isna().sum().sum())
-    numeric = df.select_dtypes(include="number")
-    numeric_cols = len(numeric.columns)
-    text_cols = cols - numeric_cols
-
-    lines = [
-        f"- Строк: **{rows:,}**",
-        f"- Колонок: **{cols:,}**",
-        f"- Числовых колонок: **{numeric_cols:,}**",
-        f"- Текстовых/других колонок: **{text_cols:,}**",
-        f"- Пустых ячеек: **{missing:,}**",
-    ]
-    return "\n".join(lines)
-
-
-def text_brief(text: str) -> str:
-    lines = text.count("\n") + 1
-    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9_]+", text.lower())
-    word_count = len(words)
-    char_count = len(text)
-
-    # Небольшой список, чтобы топ-слова выглядели полезнее.
-    stop_words = {
-        "и",
-        "в",
-        "на",
-        "по",
-        "с",
-        "к",
-        "как",
-        "что",
-        "это",
-        "для",
-        "the",
-        "and",
-        "to",
-        "of",
-        "in",
-        "is",
-    }
-    useful_words = [w for w in words if len(w) > 2 and w not in stop_words]
-    top_words = Counter(useful_words).most_common(5)
-
-    result = [
-        f"- Строк: **{lines:,}**",
-        f"- Слов: **{word_count:,}**",
-        f"- Символов: **{char_count:,}**",
-    ]
-    if top_words:
-        result.append("- Частые слова: " + ", ".join(f"`{w}` ({c})" for w, c in top_words))
-
-    return "\n".join(result)
-
-
-def build_reply(user_prompt: str) -> str:
-    df = st.session_state.df
-    prompt = user_prompt.strip()
-
-    if df is None:
-        return "\n".join(
-            [
-                "Сделал разбор вашего текста.",
-                "",
-                text_brief(prompt),
-                "",
-                "Если хотите аналитику по данным, прикрепите CSV/Excel через скрепку.",
-            ]
-        )
-
-    answer = ["Сделал быстрый разбор загруженного файла.", "", file_brief(df)]
-
-    # Пока даем простую локальную аналитику по таблице.
-    if "колон" in prompt.lower() or "столб" in prompt.lower():
-        cols_preview = ", ".join(map(str, df.columns[:12]))
-        answer.append("")
-        answer.append(f"Первые колонки: {cols_preview}")
-    elif "пропуск" in prompt.lower() or "пуст" in prompt.lower():
-        missing_by_col = df.isna().sum().sort_values(ascending=False).head(5)
-        if int(missing_by_col.sum()) > 0:
-            answer.append("")
-            answer.append("Топ-5 колонок по пропускам:")
-            for col, val in missing_by_col.items():
-                answer.append(f"- {col}: {int(val):,}")
-        else:
-            answer.append("")
-            answer.append("Пропусков не найдено.")
-    elif "график" in prompt.lower() or "диаграм" in prompt.lower():
-        answer.append("")
-        answer.append("Сейчас могу дать текстовый разбор и метрики. Графики можно добавить отдельным блоком.")
-    else:
-        answer.append("")
-        answer.append(
-            "Если нужно, уточните запрос: например, «покажите пропуски», "
-            "«какие тут ключевые метрики» или «сделайте summary по данным»."
-        )
-
-    return "\n".join(answer)
 
 
 def parse_uploaded_file(uploaded_file) -> None:
@@ -190,21 +163,15 @@ def process_chat_payload(payload) -> Optional[str]:
     if payload is None:
         return None
 
-    user_prompt = ""
-    uploaded_files = []
+    user_prompt = payload.strip() if isinstance(payload, str) else payload.text.strip()
+    uploaded_files = [] if isinstance(payload, str) else payload.files
 
-    if isinstance(payload, str):
-        user_prompt = payload.strip()
-    else:
-        user_prompt = payload.text.strip()
-        uploaded_files = payload.files
-
+    # Если пользователь прикрепил файл, сразу пробуем подключить его в контекст.
     if uploaded_files:
         uploaded_file = uploaded_files[0]
         parse_uploaded_file(uploaded_file)
 
         if st.session_state.df is not None:
-            st.session_state.uploaded_signature = f"{uploaded_file.name}:{uploaded_file.size}"
             st.session_state.messages.append(
                 {
                     "role": "assistant",
@@ -219,31 +186,76 @@ def process_chat_payload(payload) -> Optional[str]:
                     "content": "Подключен только первый файл из списка.",
                 }
             )
+    elif st.session_state.df is None and user_prompt:
+        parsed_df = try_parse_table_from_text(user_prompt)
+        if parsed_df is not None:
+            st.session_state.df = parsed_df
+            st.session_state.file_name = "Таблица из текста"
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Таблица из сообщения распознана и подключена.",
+                }
+            )
 
     return user_prompt if user_prompt else None
 
 
-def render_chat() -> None:
+def render_chat_message(message: dict[str, Any], index: int) -> None:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+        if message["role"] != "assistant":
+            return
+
+        key_metrics = message.get("key_metrics", [])
+        if key_metrics:
+            st.markdown("**Ключевые метрики:**")
+            for metric in key_metrics:
+                st.markdown(f"- {metric}")
+
+        chart_specs = message.get("charts", [])
+        if chart_specs and st.session_state.df is None:
+            st.caption("Для построения графиков нужно снова подключить файл.")
+            return
+
+        for chart_idx, chart_spec in enumerate(chart_specs):
+            chart_title = chart_spec.get("title", "Без названия")
+            try:
+                figure = build_chart_figure(st.session_state.df, chart_spec)
+                if figure is None:
+                    st.caption(f"Не удалось построить график: {chart_title}")
+                    continue
+                st.plotly_chart(
+                    figure,
+                    use_container_width=True,
+                    key=f"chart_{index}_{chart_idx}",
+                )
+            except Exception:
+                st.caption(f"Не удалось построить график: {chart_title}")
+
+
+def render_chat(llm_config: dict[str, Any]) -> None:
+    st.markdown(
+        f'<div style="font-size:0.84rem; color:#6b7280; margin-top:0.35rem; margin-bottom:0.02rem;">Model: <code>{llm_config["model"]}</code></div>',
+        unsafe_allow_html=True,
+    )
     st.title("LLM-аналитика")
     st.caption("Задайте вопрос по данным или отправьте текстовый запрос.")
 
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    for idx, message in enumerate(st.session_state.messages):
+        render_chat_message(message, idx)
 
     if st.session_state.df is not None:
         c1, c2 = st.columns([6, 1])
         with c1:
-            r, c = st.session_state.df.shape
-            st.caption(f"Подключен файл: **{st.session_state.file_name}** ({r:,} x {c:,})")
+            rows, cols = st.session_state.df.shape
+            st.caption(f"Подключен файл: **{st.session_state.file_name}** ({rows:,} x {cols:,})")
         with c2:
             if st.button("Сбросить", use_container_width=True):
                 st.session_state.df = None
                 st.session_state.file_name = None
-                st.session_state.uploaded_signature = None
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": "Файл отсоединен."}
-                )
+                st.session_state.messages.append({"role": "assistant", "content": "Файл отсоединен."})
                 st.rerun()
 
     payload = st.chat_input(
@@ -259,22 +271,45 @@ def render_chat() -> None:
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
-    assistant_reply = build_reply(user_prompt)
-    st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
-    with st.chat_message("assistant"):
-        st.markdown(assistant_reply)
+    try:
+        # Берем текстовый ответ от модели, а метрики/графики строим локально в UI.
+        ai_payload = get_ai_response(
+            user_prompt=user_prompt,
+            df=st.session_state.df,
+            config=llm_config,
+        )
+        helper_payload = build_local_fallback_payload(user_prompt, st.session_state.df)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": ai_payload["summary"],
+            "key_metrics": helper_payload["key_metrics"],
+            "charts": helper_payload["charts"],
+        }
+    except Exception as exc:
+        helper_payload = build_local_fallback_payload(user_prompt, st.session_state.df)
+        assistant_message = {
+            "role": "assistant",
+            "content": helper_payload["summary"],
+            "key_metrics": helper_payload["key_metrics"],
+            "charts": helper_payload["charts"],
+        }
+        st.warning(f"Ответ от модели временно недоступен: {exc}")
+
+    st.session_state.messages.append(assistant_message)
+    render_chat_message(assistant_message, len(st.session_state.messages) - 1)
 
 
-def main() -> None:
-    init_state()
-
+def apply_ui_styles() -> None:
     st.markdown(
         """
         <style>
             .block-container {
                 max-width: 1200px;
-                padding-top: 1.5rem;
+                padding-top: 3.2rem;
                 padding-bottom: 1.5rem;
+            }
+            .block-container h1 {
+                padding: 1rem 0px 1rem !important;
             }
             div[data-testid="stChatInput"] [data-baseweb="textarea"] {
                 border-radius: 16px !important;
@@ -289,12 +324,8 @@ def main() -> None:
                 padding-right: 12px !important;
                 box-sizing: border-box !important;
             }
-            div[data-testid="stChatInput"] [data-baseweb="textarea"] textarea::placeholder {
-                opacity: 0.9 !important;
-            }
             div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] {
                 border-right: none !important;
-                box-shadow: none !important;
                 align-self: center !important;
                 margin-top: 0 !important;
             }
@@ -309,14 +340,6 @@ def main() -> None:
                 display: inline-flex !important;
                 align-items: center !important;
                 justify-content: center !important;
-            }
-            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] > button:hover,
-            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] > button:focus,
-            div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] > button:focus-visible {
-                border-color: #d7dbe0 !important;
-                box-shadow: none !important;
-                background: #ffffff !important;
-                outline: none !important;
             }
             div[data-testid="stChatInput"] [data-testid="stChatInputFileUploadButton"] + div {
                 display: block !important;
@@ -333,8 +356,13 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+
+def main() -> None:
+    init_state()
+    llm_config = load_llm_config()
+    apply_ui_styles()
     render_sidebar()
-    render_chat()
+    render_chat(llm_config)
 
 
 if __name__ == "__main__":

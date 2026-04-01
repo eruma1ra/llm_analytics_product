@@ -2,5 +2,7 @@ services:
   llm-analytics:
     build: .
     container_name: llm-analytics
+    env_file:
+      - .env
     ports:
       - "8501:8501"
