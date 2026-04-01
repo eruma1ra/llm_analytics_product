@@ -7,8 +7,8 @@
 
 ## Ссылка на онлайн-версию
 
-- Прод: [Открыть приложение](https://PROD-LINK)
-- URL: `https://PROD-LINK`
+- Прод: [Открыть приложение](https://fefu-analytics.streamlit.app)
+- URL: `https://fefu-analytics.streamlit.app`
 
 ## Интерфейс веб-приложения
 
