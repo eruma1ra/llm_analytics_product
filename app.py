@@ -19,7 +19,7 @@ from analytics_core import (
     wants_chart_request,
 )
 from chat_cache import cleanup_expired_cache, persist_user_cache, restore_user_cache
-from llm_client import get_chart_specs, load_llm_config, stream_text_response
+from llm_client import get_chart_specs, load_llm_config, run_dataframe_agent, stream_text_response
 
 
 st.set_page_config(page_title="LLM-аналитика", layout="wide")
@@ -534,6 +534,39 @@ def render_chat_message(message: dict[str, Any], index: int) -> None:
                 st.caption(f"Не удалось построить график: {chart_title}. Ошибка: {exc}")
 
 
+def _chart_signature(chart_spec: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(chart_spec.get("type", "")).strip().lower(),
+        str(chart_spec.get("x", "")).strip().lower(),
+        str(chart_spec.get("y", "")).strip().lower(),
+        str(chart_spec.get("agg", "")).strip().lower(),
+    )
+
+
+def complete_chart_specs_to_requested_count(
+    chart_specs: list[dict[str, Any]],
+    prompt: str,
+    df: pd.DataFrame,
+    requested_count: int,
+) -> list[dict[str, Any]]:
+    target = max(1, min(int(requested_count), 5))
+    completed = list(chart_specs[:target])
+    if not wants_chart_request(prompt) or len(completed) >= target:
+        return completed
+
+    seen = {_chart_signature(spec) for spec in completed}
+    fallback_specs = build_fallback_chart_specs(prompt, df, max_charts=5)
+    for spec in fallback_specs:
+        signature = _chart_signature(spec)
+        if signature in seen:
+            continue
+        completed.append(spec)
+        seen.add(signature)
+        if len(completed) >= target:
+            break
+    return completed[:target]
+
+
 def render_chat(llm_config: dict[str, Any]) -> None:
     st.markdown(
         f'<div style="font-size:0.84rem; color:#6b7280; margin-top:0.35rem; margin-bottom:0.02rem;">Model: <code>{llm_config["model"]}</code></div>',
@@ -585,23 +618,23 @@ def render_chat(llm_config: dict[str, Any]) -> None:
     with st.chat_message("assistant"):
         placeholder = st.empty()
         try:
-            for chunk in stream_text_response(
-                user_prompt=user_prompt,
-                df=st.session_state.df,
-                config=llm_config,
-            ):
-                assistant_text += chunk
-                placeholder.markdown(assistant_text + "▌")
-
-            assistant_text = assistant_text.strip() or "Модель не вернула текстовый ответ."
-            placeholder.markdown(assistant_text)
-
-            raw_chart_specs = get_chart_specs(
-                user_prompt=user_prompt,
-                df=st.session_state.df,
-                config=llm_config,
-            )
             if st.session_state.df is not None:
+                with st.spinner("Анализирую данные..."):
+                    agent_result = run_dataframe_agent(
+                        user_prompt=user_prompt,
+                        df=st.session_state.df,
+                        config=llm_config,
+                    )
+                assistant_text = (
+                    str(agent_result.get("summary", "")).strip()
+                    or "Модель не вернула текстовый ответ."
+                )
+                placeholder.markdown(assistant_text)
+                raw_chart_specs = [
+                    item
+                    for item in agent_result.get("chart_specs", [])
+                    if isinstance(item, dict)
+                ]
                 normalized_specs = normalize_chart_specs(
                     raw_chart_specs,
                     st.session_state.df,
@@ -612,17 +645,30 @@ def render_chat(llm_config: dict[str, Any]) -> None:
                     user_prompt,
                     default_limit=requested_chart_limit,
                 )
-                if wants_chart_request(user_prompt) and not chart_specs:
-                    fallback_specs = build_fallback_chart_specs(
-                        user_prompt,
-                        st.session_state.df,
-                        max_charts=requested_chart_limit,
-                    )
-                    chart_specs = select_chart_specs_by_prompt(
-                        fallback_specs,
-                        user_prompt,
-                        default_limit=requested_chart_limit,
-                    )
+                chart_specs = complete_chart_specs_to_requested_count(
+                    chart_specs,
+                    user_prompt,
+                    st.session_state.df,
+                    requested_chart_limit,
+                )
+            else:
+                for chunk in stream_text_response(
+                    user_prompt=user_prompt,
+                    df=None,
+                    config=llm_config,
+                ):
+                    assistant_text += chunk
+                    placeholder.markdown(assistant_text + "▌")
+
+                assistant_text = assistant_text.strip() or "Модель не вернула текстовый ответ."
+                placeholder.markdown(assistant_text)
+
+                raw_chart_specs = get_chart_specs(
+                    user_prompt=user_prompt,
+                    df=None,
+                    config=llm_config,
+                )
+                chart_specs = raw_chart_specs
 
             for chart_idx, chart_spec in enumerate(chart_specs):
                 figure = build_chart_figure(st.session_state.df, chart_spec)

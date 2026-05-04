@@ -10,6 +10,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+from code_interpreter import execute_python_analysis
 from llm_stream import stream_chat_completion
 
 
@@ -21,6 +22,8 @@ JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(?P<body>.*?)```", re.DOTALL | re.IG
 class ChatCompletionResult:
     content: str
     finish_reason: str
+    tool_calls: list[dict[str, Any]]
+    message: dict[str, Any]
 
 
 def _env(name: str) -> str:
@@ -44,6 +47,16 @@ def _env_float(name: str) -> float:
         raise ValueError(f"В .env поле {name} должно быть числом.")
 
 
+def _env_int_default(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"В .env поле {name} должно быть целым числом.")
+
+
 def load_llm_config() -> dict[str, Any]:
     return {
         "provider_label": _env("LLM_PROVIDER_LABEL"),
@@ -55,6 +68,8 @@ def load_llm_config() -> dict[str, Any]:
         "max_tokens": _env_int("LLM_MAX_TOKENS"),
         "max_context_rows": _env_int("LLM_MAX_CONTEXT_ROWS"),
         "max_charts": _env_int("LLM_MAX_CHARTS"),
+        "agent_max_steps": _env_int_default("LLM_AGENT_MAX_STEPS", 5),
+        "code_timeout_seconds": _env_int_default("LLM_CODE_TIMEOUT_SECONDS", 12),
     }
 
 
@@ -241,6 +256,14 @@ def _extract_finish_reason(data: dict[str, Any]) -> str:
     return str(choices[0].get("finish_reason", "") or "")
 
 
+def _extract_message(data: dict[str, Any]) -> dict[str, Any]:
+    choices = data.get("choices", [])
+    if not choices:
+        return {}
+    message = choices[0].get("message", {})
+    return message if isinstance(message, dict) else {}
+
+
 def _looks_truncated(text: str) -> bool:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -276,9 +299,11 @@ def _merge_with_overlap(base: str, continuation: str) -> str:
 
 
 def call_chat_completion(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     api_key: str,
     config: dict[str, Any],
+    tools: Optional[list[dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
 ) -> ChatCompletionResult:
     payload = {
         "model": config["model"],
@@ -286,6 +311,10 @@ def call_chat_completion(
         "temperature": config["temperature"],
         "max_tokens": config["max_tokens"],
     }
+    if tools:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -298,9 +327,12 @@ def call_chat_completion(
     )
     response.raise_for_status()
     data = response.json()
+    message = _extract_message(data)
     return ChatCompletionResult(
-        content=_extract_content(data),
+        content=_extract_content(data) if message.get("content") is not None else "",
         finish_reason=_extract_finish_reason(data),
+        tool_calls=message.get("tool_calls", []) if isinstance(message.get("tool_calls"), list) else [],
+        message=message,
     )
 
 
@@ -310,6 +342,16 @@ def stream_text_response(
     config: dict[str, Any],
     api_key: str = "",
 ) -> Iterator[str]:
+    if df is not None:
+        result = run_dataframe_agent(
+            user_prompt=user_prompt,
+            df=df,
+            config=config,
+            api_key=api_key,
+        )
+        yield str(result.get("summary", "")).strip() or "Модель не вернула текстовый ответ."
+        return
+
     resolved_api_key = _resolve_api_key(api_key)
     text_messages = build_text_messages(user_prompt=user_prompt, df=df, config=config)
     plain_user_content = text_messages[-1]["content"] if text_messages else user_prompt
@@ -439,6 +481,308 @@ def _parse_chart_specs(raw: str, max_charts: int) -> list[dict[str, Any]]:
     return []
 
 
+ANALYSIS_TOOL_NAME = "execute_python"
+
+
+def _analysis_tool_schema() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": ANALYSIS_TOOL_NAME,
+                "description": (
+                    "Выполняет Python/pandas-код над загруженным датасетом. "
+                    "В коде уже доступна переменная df. "
+                    "Код должен посчитать метрики по df, записать текстовый вывод в answer, "
+                    "а спецификации графиков при необходимости в charts."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": (
+                                "Python-код. Доступны df, pd и px. "
+                                "Положите краткий текстовый результат в переменную answer. "
+                                "Для графиков задайте charts как список словарей с полями "
+                                "type, title, x, y, agg, top_n."
+                            ),
+                        }
+                    },
+                    "required": ["code"],
+                },
+            },
+        }
+    ]
+
+
+def _analysis_system_prompt(max_charts: int) -> str:
+    return (
+        "Вы ИИ-агент для анализа табличных данных. "
+        "Загруженный датасет доступен только внутри tool execute_python как pandas DataFrame df. "
+        "Перед любым содержательным ответом по датасету обязательно вызовите execute_python "
+        "и посчитайте нужные метрики кодом. Не отвечайте по памяти и не выдумывайте значения. "
+        "В первом вызове при необходимости исследуйте df.shape, df.columns, df.dtypes, df.head(), "
+        "пропуски и базовые распределения. "
+        "Код должен записать текстовый результат в переменную answer. "
+        "Если пользователь просит графики или они нужны для результата, задайте charts. "
+        "Формат charts: список JSON-совместимых словарей "
+        "{type: 'bar|line|scatter|pie|histogram', x: '<column>', y: '<column|null>', "
+        "agg: 'sum|mean|count|median|max|min', title: '<title>', top_n: 30}. "
+        f"Максимум графиков: {max(1, min(int(max_charts), 5))}. "
+        "После результата tool дайте финальный ответ на русском языке: коротко, по делу, "
+        "с конкретными числами из вычислений."
+    )
+
+
+def _tool_choice_required() -> dict[str, Any]:
+    return {"type": "function", "function": {"name": ANALYSIS_TOOL_NAME}}
+
+
+def _parse_tool_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
+    function = tool_call.get("function", {})
+    raw_args = function.get("arguments", "{}")
+    if isinstance(raw_args, dict):
+        return raw_args
+    if not isinstance(raw_args, str):
+        return {}
+    try:
+        parsed = json.loads(raw_args)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _collect_chart_specs(tool_result: dict[str, Any]) -> list[dict[str, Any]]:
+    charts = tool_result.get("charts", [])
+    if not isinstance(charts, list):
+        return []
+    return [item for item in charts if isinstance(item, dict)]
+
+
+def _extract_code_from_json_response(raw: str) -> str:
+    for candidate in _extract_json_candidates(raw):
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("code"), str):
+            return data["code"].strip()
+    return ""
+
+
+def _fallback_agent_via_code_protocol(
+    user_prompt: str,
+    df: pd.DataFrame,
+    config: dict[str, Any],
+    api_key: str,
+) -> dict[str, Any]:
+    max_charts = max(1, min(int(config["max_charts"]), 5))
+    code_messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "Вы пишете код для tool execute_python. "
+                "Верните ТОЛЬКО JSON без markdown в формате {\"code\":\"...\"}. "
+                "В коде доступен pandas DataFrame df, а также pd и px. "
+                "Код обязан исследовать df и посчитать ответ на вопрос пользователя. "
+                "Запишите краткий текстовый вывод в переменную answer. "
+                "Если нужны графики, запишите charts как список спецификаций "
+                "type/x/y/agg/title/top_n, максимум "
+                f"{max_charts}. Не используйте внешние файлы и import."
+            ),
+        },
+        {"role": "user", "content": f"Запрос пользователя: {user_prompt}"},
+    ]
+
+    code_result = call_chat_completion(
+        messages=code_messages,
+        api_key=api_key,
+        config=config,
+    )
+    code = _extract_code_from_json_response(code_result.content)
+    if not code:
+        return {
+            "summary": "Модель не смогла сформировать код анализа для интерпретатора.",
+            "chart_specs": [],
+            "tool_used": False,
+            "tool_results": [],
+        }
+
+    tool_result = execute_python_analysis(
+        df=df,
+        code=code,
+        timeout_seconds=config["code_timeout_seconds"],
+    )
+
+    if not tool_result.get("ok"):
+        repair_messages = code_messages + [
+            {"role": "assistant", "content": json.dumps({"code": code}, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": (
+                    "Код упал в execute_python. Верните исправленный JSON {\"code\":\"...\"}. "
+                    f"Ошибка:\n{tool_result.get('error', '')}"
+                ),
+            },
+        ]
+        repaired = call_chat_completion(
+            messages=repair_messages,
+            api_key=api_key,
+            config=config,
+        )
+        repaired_code = _extract_code_from_json_response(repaired.content)
+        if repaired_code:
+            tool_result = execute_python_analysis(
+                df=df,
+                code=repaired_code,
+                timeout_seconds=config["code_timeout_seconds"],
+            )
+
+    charts = _collect_chart_specs(tool_result)
+    final_messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "Сформируйте финальный аналитический ответ на русском языке. "
+                "Используйте только результат execute_python, не добавляйте непроверенные числа."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Запрос пользователя: {user_prompt}\n\n"
+                f"Результат execute_python:\n{json.dumps(tool_result, ensure_ascii=False)}"
+            ),
+        },
+    ]
+    final_result = call_chat_completion(
+        messages=final_messages,
+        api_key=api_key,
+        config=config,
+    )
+    summary = final_result.content.strip() or str(tool_result.get("answer", "")).strip()
+    if not summary and tool_result.get("error"):
+        summary = f"Интерпретатор кода вернул ошибку: {tool_result['error']}"
+
+    return {
+        "summary": summary or "Не удалось получить содержательный результат анализа.",
+        "chart_specs": charts,
+        "tool_used": True,
+        "tool_results": [tool_result],
+    }
+
+
+def run_dataframe_agent(
+    user_prompt: str,
+    df: pd.DataFrame,
+    config: dict[str, Any],
+    api_key: str = "",
+) -> dict[str, Any]:
+    resolved_api_key = _resolve_api_key(api_key)
+    max_steps = max(2, min(int(config["agent_max_steps"]), 8))
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _analysis_system_prompt(config["max_charts"])},
+        {
+            "role": "user",
+            "content": (
+                "Датасет уже загружен в tool execute_python как переменная df. "
+                f"Запрос пользователя: {user_prompt}"
+            ),
+        },
+    ]
+    tools = _analysis_tool_schema()
+    chart_specs: list[dict[str, Any]] = []
+    tool_results: list[dict[str, Any]] = []
+    tool_used = False
+
+    try:
+        for step in range(max_steps):
+            result = call_chat_completion(
+                messages=messages,
+                api_key=resolved_api_key,
+                config=config,
+                tools=tools,
+                tool_choice=_tool_choice_required() if not tool_used else "auto",
+            )
+
+            if not result.tool_calls:
+                if tool_used and result.content.strip():
+                    return {
+                        "summary": result.content.strip(),
+                        "chart_specs": chart_specs,
+                        "tool_used": True,
+                        "tool_results": tool_results,
+                    }
+                break
+
+            assistant_message = {
+                "role": "assistant",
+                "content": result.message.get("content") or "",
+                "tool_calls": result.tool_calls,
+            }
+            messages.append(assistant_message)
+
+            for tool_call in result.tool_calls:
+                function = tool_call.get("function", {})
+                if function.get("name") != ANALYSIS_TOOL_NAME:
+                    continue
+
+                args = _parse_tool_arguments(tool_call)
+                code = str(args.get("code", "")).strip()
+                tool_result = execute_python_analysis(
+                    df=df,
+                    code=code,
+                    timeout_seconds=config["code_timeout_seconds"],
+                )
+                tool_used = True
+                tool_results.append(tool_result)
+                chart_specs.extend(_collect_chart_specs(tool_result))
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id", "execute_python"),
+                        "name": ANALYSIS_TOOL_NAME,
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    }
+                )
+
+        if tool_used:
+            final_messages = messages + [
+                {
+                    "role": "user",
+                    "content": (
+                        "Теперь дайте финальный краткий ответ на русском языке, "
+                        "используя только результаты execute_python."
+                    ),
+                }
+            ]
+            final_result = call_chat_completion(
+                messages=final_messages,
+                api_key=resolved_api_key,
+                config=config,
+            )
+            return {
+                "summary": final_result.content.strip()
+                or str(tool_results[-1].get("answer", "")).strip()
+                or "Анализ выполнен, но модель не вернула текстовый ответ.",
+                "chart_specs": chart_specs,
+                "tool_used": True,
+                "tool_results": tool_results,
+            }
+    except requests.HTTPError:
+        pass
+    except Exception:
+        pass
+
+    return _fallback_agent_via_code_protocol(
+        user_prompt=user_prompt,
+        df=df,
+        config=config,
+        api_key=resolved_api_key,
+    )
+
+
 def get_chart_specs(
     user_prompt: str,
     df: Optional[pd.DataFrame],
@@ -466,6 +810,14 @@ def get_ai_response(
     config: dict[str, Any],
     api_key: str = "",
 ) -> dict[str, Any]:
+    if df is not None:
+        return run_dataframe_agent(
+            user_prompt=user_prompt,
+            df=df,
+            config=config,
+            api_key=api_key,
+        )
+
     resolved_api_key = _resolve_api_key(api_key)
 
     text_messages = build_text_messages(user_prompt=user_prompt, df=df, config=config)

@@ -260,6 +260,17 @@ def _pick_quantity_column(df: pd.DataFrame) -> Optional[str]:
     return numeric_cols[0]
 
 
+def _pick_numeric_columns(df: pd.DataFrame) -> list[str]:
+    numeric_cols = [str(col) for col in df.select_dtypes(include="number").columns]
+    if numeric_cols:
+        return numeric_cols
+
+    converted = df.copy()
+    for col in converted.columns:
+        converted[col] = pd.to_numeric(converted[col], errors="coerce")
+    return [str(col) for col in converted.columns if converted[col].notna().sum() > 0]
+
+
 def _pick_date_column(df: pd.DataFrame) -> Optional[str]:
     for col in df.columns:
         name = str(col).lower()
@@ -273,9 +284,24 @@ def build_fallback_chart_specs(prompt: str, df: pd.DataFrame, max_charts: int = 
         return []
     group_col = _pick_group_column(df)
     qty_col = _pick_quantity_column(df)
+    numeric_cols = _pick_numeric_columns(df)
     date_col = _pick_date_column(df)
 
     specs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def add_spec(spec: dict[str, Any]) -> None:
+        key = (
+            str(spec.get("type", "")),
+            str(spec.get("x", "")),
+            str(spec.get("y", "")),
+            str(spec.get("agg", "")),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        specs.append(spec)
+
     text = (prompt or "").lower()
 
     wants_trend = "тренд" in text or "trend" in text or "динам" in text
@@ -283,7 +309,7 @@ def build_fallback_chart_specs(prompt: str, df: pd.DataFrame, max_charts: int = 
 
     if wants_trend and qty_col:
         x_for_trend = date_col or group_col
-        specs.append(
+        add_spec(
             {
                 "type": "line",
                 "title": f"Тренд {qty_col} по {x_for_trend}",
@@ -296,7 +322,7 @@ def build_fallback_chart_specs(prompt: str, df: pd.DataFrame, max_charts: int = 
 
     if wants_group:
         if qty_col:
-            specs.append(
+            add_spec(
                 {
                     "type": "pie",
                     "title": f"Распределение {qty_col} по {group_col}",
@@ -306,7 +332,7 @@ def build_fallback_chart_specs(prompt: str, df: pd.DataFrame, max_charts: int = 
                     "top_n": 30,
                 }
             )
-            specs.append(
+            add_spec(
                 {
                     "type": "bar",
                     "title": f"{qty_col} по {group_col}",
@@ -317,7 +343,7 @@ def build_fallback_chart_specs(prompt: str, df: pd.DataFrame, max_charts: int = 
                 }
             )
         else:
-            specs.append(
+            add_spec(
                 {
                     "type": "pie",
                     "title": f"Распределение по {group_col}",
@@ -327,7 +353,7 @@ def build_fallback_chart_specs(prompt: str, df: pd.DataFrame, max_charts: int = 
                     "top_n": 30,
                 }
             )
-            specs.append(
+            add_spec(
                 {
                     "type": "bar",
                     "title": f"Количество по {group_col}",
@@ -338,19 +364,51 @@ def build_fallback_chart_specs(prompt: str, df: pd.DataFrame, max_charts: int = 
                 }
             )
 
-    if not specs:
-        specs.append(
+    if qty_col:
+        add_spec(
             {
                 "type": "bar",
-                "title": f"Количество по {group_col}",
+                "title": f"{qty_col} по {group_col}",
                 "x": group_col,
-                "y": None,
-                "agg": "count",
+                "y": qty_col,
+                "agg": "sum",
                 "top_n": 30,
             }
         )
-        if qty_col:
-            specs.append(
+        add_spec(
+            {
+                "type": "pie",
+                "title": f"Доли {qty_col} по {group_col}",
+                "x": group_col,
+                "y": qty_col,
+                "agg": "sum",
+                "top_n": 12,
+            }
+        )
+        add_spec(
+            {
+                "type": "histogram",
+                "title": f"Распределение {qty_col}",
+                "x": qty_col,
+                "y": None,
+                "agg": "count",
+                "top_n": 50,
+            }
+        )
+
+        if date_col:
+            add_spec(
+                {
+                    "type": "line",
+                    "title": f"Динамика {qty_col} по {date_col}",
+                    "x": date_col,
+                    "y": qty_col,
+                    "agg": "sum",
+                    "top_n": 100,
+                }
+            )
+        else:
+            add_spec(
                 {
                     "type": "line",
                     "title": f"{qty_col} по {group_col}",
@@ -360,6 +418,40 @@ def build_fallback_chart_specs(prompt: str, df: pd.DataFrame, max_charts: int = 
                     "top_n": 50,
                 }
             )
+
+    if len(numeric_cols) >= 2:
+        add_spec(
+            {
+                "type": "scatter",
+                "title": f"Связь {numeric_cols[0]} и {numeric_cols[1]}",
+                "x": numeric_cols[0],
+                "y": numeric_cols[1],
+                "agg": "mean",
+                "top_n": 100,
+            }
+        )
+
+    if not specs:
+        add_spec(
+            {
+                "type": "bar",
+                "title": f"Количество по {group_col}",
+                "x": group_col,
+                "y": None,
+                "agg": "count",
+                "top_n": 30,
+            }
+        )
+        add_spec(
+            {
+                "type": "pie",
+                "title": f"Доли записей по {group_col}",
+                "x": group_col,
+                "y": None,
+                "agg": "count",
+                "top_n": 12,
+            }
+        )
 
     return normalize_chart_specs(specs, df, max_charts=max_charts)
 
